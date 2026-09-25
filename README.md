@@ -18,3 +18,6 @@ https://tgd.kr/s/zomul_e/64509929
 
 파일이 다운로드가 안될때<br>
 https://moon-house.tistory.com/59
+
+## License
+MIT License. See [LICENSE](LICENSE).
