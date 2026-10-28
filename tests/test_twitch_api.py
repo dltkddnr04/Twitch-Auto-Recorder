@@ -26,7 +26,8 @@ class TwitchApiTests(unittest.TestCase):
             "data": [{"broadcaster_id": "1", "broadcaster_login": "example"}],
             "pagination": {},
         }
-        with patch.object(twitch_api, "_request", return_value=response) as request:
+        with patch.object(twitch_api, "_request", return_value=response) as request, \
+             patch.dict(os.environ, {"TWITCH_CLIENT_ID": "cid", "TWITCH_USER_TOKEN": "token"}, clear=True):
             channels = twitch_api.get_follow_data("2")
         self.assertEqual(channels, [{"to_id": "1", "to_login": "example"}])
         self.assertIn("channels/followed", request.call_args.args[1])

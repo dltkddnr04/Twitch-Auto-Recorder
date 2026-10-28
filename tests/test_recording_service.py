@@ -129,7 +129,7 @@ class RecordingServiceTests(unittest.TestCase):
     def test_no_ffmpeg_required_for_ts(self):
         with tempfile.TemporaryDirectory() as directory:
             staging = Path(directory) / "one.capture"
-            staging.write_bytes(b"\x47" + b"\x00" * 188)
+            staging.write_bytes(b"\x47" + b"\x00" * 187 + b"\x47")
             worker = service.RecordingWorker("channel", directory, "ts", options=options())
             with patch.object(service.shutil, "which", return_value=None):
                 self.assertGreater(worker._finalize(staging), 0)
