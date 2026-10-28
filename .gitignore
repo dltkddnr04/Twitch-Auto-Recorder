@@ -1,11 +1,11 @@
 .DS_Store
 __pycache__/
 *.py[cod]
-shazam_project
-video_sample
-image_hash_sample
-.pytest_cache/
 .venv/
-streamer_list.pickle
-setup.pickle
+.pytest_cache/
+config.json
 *.capture
+*.raw
+*.ts
+*.mp4
+*.mkv
