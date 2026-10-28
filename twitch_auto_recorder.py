@@ -8,8 +8,9 @@ import os
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QWidget, QTextBrowser, QGridLayout, QGroupBox, QLabel, QMessageBox, QRadioButton)
 import PyQt5.QtWidgets as qtwid
-from PyQt5.QtCore import Qt
-from function import (twitch_api, update, recorder)
+from PyQt5.QtCore import Qt, pyqtSignal
+from function import (twitch_api, update)
+from function.recording_service import RecordingWorker, validated_channel
 
 current_version = "1.3.0"
 
@@ -19,6 +20,9 @@ if not os.path.isfile("streamer_list.pickle"):
         pickle.dump([], f)
 
 class MyApp(QWidget):
+    log_signal = pyqtSignal(str)
+    update_signal = pyqtSignal(object)
+
     def __init__(self):
         if not os.path.isfile("setup.pickle"):
             extension = 'ts'
@@ -27,10 +31,14 @@ class MyApp(QWidget):
 
         with open("setup.pickle", "rb") as f:
             self.extension = pickle.load(f)
+        self.workers = {}
+        self.worker_threads = {}
         super().__init__()
+        self.log_signal.connect(self.console_print)
+        self.update_signal.connect(self._on_update_result)
         self.initUI()
 
-        QMessageBox.information(self, "경고", "ts 이외의 파일형식을 사용할경우 녹화가 중간에 중단될시 파일이 유실될 수 있습니다.\n컴퓨터나 프로그램이 강제로 종료될 가능성이 있는경우 ts 파일로 녹화한 후에 인코딩하는것을 추천합니다.")
+        # Actual TS/fMP4 container is detected; optional remux preserves the raw source on failure.
 
     def initUI(self):
         grid = QGridLayout()
@@ -44,14 +52,8 @@ class MyApp(QWidget):
         self.resize(600, 400)
         self.show()
 
-        try:
-            twitch_api.get_header_online()
 
-        except:
-            QMessageBox.information(self, "경고", "인터넷에 연결되어있지 않습니다.\n인터넷 연결을 확인해주세요.")
-            exit()
-
-        self.update_check()
+        threading.Thread(target=self.update_check, daemon=True).start()
         self.start_program()
 
     def createSetupGroup(self):
@@ -153,115 +155,126 @@ class MyApp(QWidget):
         date = "[" + datetime.today().strftime('%Y-%m-%d %H:%M:%S') + "]"
         self.tb.append(date + " " + message)
         
-    def stream_record(self, streamer, streamer_id):
-        if streamer_id == None:
-            streamer_id = twitch_api.get_id_from_login(streamer)
-        while True:
-            if twitch_api.get_stream_data(streamer_id):
-                self.console_print(streamer + "님 방송 녹화 시작")
-                recorder.download_stream_m3u8_legacy(streamer, self.extension)
-                self.console_print(streamer + "님 방송 녹화 종료")
-            if not self.lbox_item.findItems(streamer, Qt.MatchExactly):
-                break
-            time.sleep(10)
+    def _start_worker(self, streamer):
+        if streamer in self.workers:
+            return
+        worker = RecordingWorker(streamer, extension=self.extension, log=self.log_signal.emit)
+        thread = threading.Thread(target=worker.run, name=streamer, daemon=True)
+        self.workers[streamer] = worker
+        self.worker_threads[streamer] = thread
+        thread.start()
+
+    def _stop_worker(self, streamer):
+        worker = self.workers.pop(streamer, None)
+        self.worker_threads.pop(streamer, None)
+        if worker:
+            worker.stop()
+
+    def _save_streamers(self):
+        with open("streamer_list.pickle", "wb") as f:
+            pickle.dump(list(self.workers), f)
 
     def start_program(self):
         self.console_print("프로그램 시작")
-
-        with open("streamer_list.pickle", 'rb') as f:
-            streamer_list = pickle.load(f)
-            if streamer_list != []:
-                self.console_print("스트리머 불러오기 완료")
-
-                for streamer in streamer_list:
+        try:
+            with open("streamer_list.pickle", "rb") as f:
+                streamers = pickle.load(f)
+            if not isinstance(streamers, list):
+                raise ValueError("Invalid streamer list")
+        except (OSError, ValueError, pickle.PickleError, EOFError) as exc:
+            self.console_print("스트리머 목록 읽기 실패: " + str(exc))
+            streamers = []
+        for name in streamers:
+            try:
+                streamer = validated_channel(name)
+                if streamer not in self.workers:
                     self.lbox_item.addItem(streamer)
+                    self._start_worker(streamer)
+            except (ValueError, TypeError) as exc:
+                self.console_print("잘못된 채널 아이디: " + str(exc))
+        self._save_streamers()
 
-                    threading.Thread(target=self.stream_record, args=(streamer, None), name=streamer).start()
+    def closeEvent(self, event):
+        threads = list(self.worker_threads.values())
+        for worker in list(self.workers.values()):
+            worker.stop()
+        deadline = time.monotonic() + 15
+        for thread in threads:
+            thread.join(timeout=max(0, deadline - time.monotonic()))
+        event.accept()
 
     def update_check(self):
-        # 업데이트 확인 코드
+        # Network I/O happens on a worker; only the main thread updates Qt.
         try:
             latest_version = update.get_latest_version()
-            if update.compare_version(current_version, latest_version):
-                QMessageBox.information(self, "업데이트 알림", "현재 " + latest_version + " 버전이 사용가능합니다.\n업데이트 주소:\nhttps://github.com/dltkddnr04/Twitch-Auto-Recorder/releases")
+            self.update_signal.emit((latest_version, None))
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            self.update_signal.emit((None, str(exc)))
 
-        except:
-            QMessageBox.information(self, "경고", "인터넷에 연결되어있지 않습니다.\n인터넷 연결을 확인해주세요.")
+    def _on_update_result(self, result):
+        latest_version, error = result
+        if error:
+            self.console_print("업데이트 확인 실패: " + error)
+        elif update.compare_version(current_version, latest_version):
+            QMessageBox.information(self, "업데이트 알림",
+                "현재 " + latest_version + " 버전이 사용가능합니다.\n"
+                "https://github.com/dltkddnr04/Twitch-Auto-Recorder/releases")
 
     def Btn_addClick(self):
-        streamer = self.streamer_edit.text()
-        if streamer == "":
-            QMessageBox.information(self, "경고", "이름이 비어있습니다.")
-
+        streamer = self.streamer_edit.text().strip().lower()
+        try:
+            streamer = validated_channel(streamer)
+        except ValueError as exc:
+            QMessageBox.information(self, "경고", str(exc))
+            return
         if self.radio_option1.isChecked():
-            if self.lbox_item.findItems(streamer, Qt.MatchExactly):
-                QMessageBox.information(self, "경고", "이미 등록된 스트리머입니다.")
-                self.streamer_edit.setText("")
-            else:
-                self.add_streamer(streamer, None)
+            self.add_streamer(streamer, None)
+            return
 
-        else:
-            # 경고창으로 물어보기
-            if QMessageBox.question(self, "Warning", "기존의 모든 스트리머가 등록해제됩니다.\n 계속하시겠습니까?", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-                user = self.streamer_edit.text()
-                if not twitch_api.check_user_exists(user):
-                    QMessageBox.information(self, "경고", "존재하지 않는 유저입니다.")
-                else:
-                    # lbox_item 전부 삭제하기
-                    for i in range(self.lbox_item.count()):
-                        self.lbox_item.takeItem(0)
-
-                    streamer_list = []
-                    with open("streamer_list.pickle", 'wb') as f:
-                        pickle.dump(streamer_list, f)
-
-                    self.streamer_edit.setText("")
-
-                    self.console_print("전체 스트리머 등록 해제 완료")
-
-                    user_id = twitch_api.get_id_from_login(user)
-
-                    follow_list = twitch_api.get_follow_data(user_id)
-                    # follow_list에 스트리머 닉네임과 아이디 저장
-                    for streamer in follow_list:
-                        if not self.lbox_item.findItems(streamer['to_login'], Qt.MatchExactly):
-                            self.add_streamer(streamer['to_login'], streamer['to_id'])
-
-                    if not follow_list:
-                        self.console_print("팔로우한 스트리머가 없습니다.")
-                    else:
-                        self.console_print("팔로우한 스트리머 등록 완료")
-            else:
-                QMessageBox.information(self, "경고", "취소되었습니다.")
-            
-            self.radio_option1.setChecked(True)
-        return
+        # Followed channels require a user OAuth token with user:read:follows.
+        try:
+            twitch_api.get_header_online()
+            user_id = twitch_api.get_id_from_login(streamer)
+            follow_list = twitch_api.get_follow_data(user_id)
+        except (requests.RequestException, ValueError, KeyError, IndexError, RuntimeError) as exc:
+            QMessageBox.information(self, "API 오류", "팔로우 목록 조회 실패: " + str(exc))
+            return
+        if QMessageBox.question(
+            self, "Warning", "기존 스트리머 등록을 모두 해제하시겠습니까?",
+            QMessageBox.Yes | QMessageBox.No
+        ) != QMessageBox.Yes:
+            return
+        target_names = []
+        for followed in follow_list:
+            try:
+                name = validated_channel(followed["to_login"])
+                if name not in target_names:
+                    target_names.append(name)
+            except (ValueError, KeyError):
+                continue
+        for name in list(self.workers):
+            if name not in target_names:
+                self._stop_worker(name)
+        self.lbox_item.clear()
+        for name in target_names:
+            self.lbox_item.addItem(name)
+            if name not in self.workers:
+                self._start_worker(name)
+        self._save_streamers()
+        self.streamer_edit.clear()
+        self.radio_option1.setChecked(True)
+        self.console_print(f"팔로우한 스트리머 {len(self.workers)}명 등록 완료")
 
     def add_streamer(self, streamer, streamer_id):
-        if streamer_id == None:
-            if not twitch_api.check_user_exists(streamer):
-                QMessageBox.information(self, "경고", "존재하지 않는 스트리머입니다.")
-                return
-            else:
-                self.streamer_edit.setText("")
-                streamer_id = twitch_api.get_id_from_login(streamer)
-
-        
+        streamer = validated_channel(streamer)
+        if streamer in self.workers:
+            QMessageBox.information(self, "경고", "이미 등록된 스트리머입니다.")
+            return
         self.lbox_item.addItem(streamer)
-
-        with open("streamer_list.pickle", 'rb') as f:
-            streamer_list = pickle.load(f)
-            
-        streamer_list.extend(streamer.split())
-
-        with open("streamer_list.pickle", 'wb') as f:
-            pickle.dump(streamer_list, f)
-
-        # 스레드 이름을 streamer_id로 설정
-        threading.Thread(target=self.stream_record, args=(streamer, streamer_id), name=streamer).start()
-
+        self._start_worker(streamer)
+        self._save_streamers()
+        self.streamer_edit.clear()
         self.console_print(streamer + "님 등록 완료")
-        return
 
     def Lbox_itemSelectionChange(self):        
         item = self.lbox_item.currentItem()
@@ -271,22 +284,16 @@ class MyApp(QWidget):
             self.btn_remove.setEnabled(True)
 
     def Btn_removeClick(self):
-        selected_streamer = self.lbox_item.currentItem().text()
-
-        with open("streamer_list.pickle", 'rb') as f:
-            streamer_list = pickle.load(f)
-        
-        streamer_list.remove(selected_streamer.lower())
-
-        with open("streamer_list.pickle", 'wb') as f:
-            pickle.dump(streamer_list, f)
-
+        selected = self.lbox_item.currentItem()
+        if selected is None:
+            return
+        name = selected.text()
+        self._stop_worker(name)
+        self.lbox_item.takeItem(self.lbox_item.currentRow())
+        self._save_streamers()
         self.radio_option1.setChecked(True)
         self.maunal_mode()
-
-        self.lbox_item.takeItem(self.lbox_item.currentRow())
-        self.console_print(selected_streamer + "님 등록해제 완료")
-        return
+        self.console_print(name + "님 등록해제 완료")
 
     def maunal_mode(self):
         self.title_label.setText("스트리머 영문 닉네임")
@@ -298,18 +305,24 @@ class MyApp(QWidget):
 
     def extension_ts(self):
         self.extension = 'ts'
+        for worker in self.workers.values():
+            worker.extension = self.extension
         with open("setup.pickle", 'wb') as f:
             pickle.dump(self.extension, f)
         return
 
     def extension_mp4(self):
         self.extension = 'mp4'
+        for worker in self.workers.values():
+            worker.extension = self.extension
         with open("setup.pickle", 'wb') as f:
             pickle.dump(self.extension, f)
         return
 
     def extension_mkv(self):
         self.extension = 'mkv'
+        for worker in self.workers.values():
+            worker.extension = self.extension
         with open("setup.pickle", 'wb') as f:
             pickle.dump(self.extension, f)
         return
